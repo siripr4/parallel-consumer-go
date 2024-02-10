@@ -28,23 +28,24 @@ var (
 	group       = "group to consume within"
 )
 
-type worker func(ctx context.Context, record *kgo.Record)
+type worker func(ctx context.Context, record *kgo.Record) error
 
 // Test func
-func process(ctx context.Context, record *kgo.Record) {
+func process(ctx context.Context, record *kgo.Record) error {
 	select {
 	case <-ctx.Done():
-		fmt.Println("Context is canceled:", ctx.Err())
 		// Handle cancellation, cleanup, or return accordingly
+		return ctx.Err()
 	default:
 		// Continue with the normal logic of your function
 		fmt.Printf("\nProcessing record with key: %s", string(record.Value))
+		return nil
 	}
 }
 
 func main() {
 	seeds := []string{"localhost:9092"}
-	cl, err := kgo.NewClient(
+	client, err := kgo.NewClient(
 		kgo.DisableAutoCommit(),
 		kgo.SeedBrokers(seeds...),
 		kgo.ConsumerGroup("parallel-consumer-0"),
@@ -54,7 +55,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer cl.Close()
+	defer client.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -62,15 +63,20 @@ func main() {
 	chanMap := setUpChannels(2)
 	defer closeChannels(chanMap)
 
+	processedRecordsChan := make(chan *kgo.Record, 10)
+	defer close(processedRecordsChan)
+
 	// Set up executor, this is currently 1:1 with work queues
 	for _, v := range chanMap {
-		execute(v, process)
+		execute(v, process, processedRecordsChan)
 	}
+
+	go commitRecords(ctx, client, processedRecordsChan)
 
 	// Poll
 	fmt.Println("Polling...")
 	for {
-		fetches := cl.PollFetches(ctx)
+		fetches := client.PollFetches(ctx)
 		if errs := fetches.Errors(); len(errs) > 0 {
 			panic(fmt.Sprint(errs))
 		}
@@ -94,13 +100,19 @@ func setUpChannels(size int) map[string]chan *kgo.Record {
 	return chanMap
 }
 
-func execute(ch <-chan *kgo.Record, process worker) {
+func execute(ch <-chan *kgo.Record, process worker, processedRecordsChan chan<- *kgo.Record) {
 	go func() {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
 		for record := range ch {
-			process(ctx, record)
+			err := process(ctx, record)
+			if err != nil {
+				// dlq
+				fmt.Errorf("failed to process record: %s", string(record.Value))
+				continue
+			}
+			processedRecordsChan <- record
 		}
 	}()
 }
@@ -108,5 +120,13 @@ func execute(ch <-chan *kgo.Record, process worker) {
 func closeChannels(chanMap map[string]chan *kgo.Record) {
 	for _, v := range chanMap {
 		close(v)
+	}
+}
+
+func commitRecords(ctx context.Context, client *kgo.Client, ch <-chan *kgo.Record) {
+	fmt.Println("Offset committer")
+	for record := range ch {
+		fmt.Printf("\n commiting record: %s", string(record.Value))
+		client.CommitRecords(ctx, record)
 	}
 }
